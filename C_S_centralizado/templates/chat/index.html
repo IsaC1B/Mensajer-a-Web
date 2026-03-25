@@ -170,6 +170,17 @@
             color: var(--fg); padding-left: 2px;
         }
 
+        .msg-badge-private {
+            display: inline-block;
+            margin-left: 8px;
+            padding: 1px 6px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: 700;
+            color: #fff;
+            background: linear-gradient(135deg, var(--blue), var(--accent2));
+        }
+
         /* ── PANEL DE USUARIOS ────────────────────── */
         .users-panel {
             width: 220px; flex-shrink: 0;
@@ -192,8 +203,13 @@
             padding: 8px 12px; border-radius: 8px;
             font-size: 13px; font-weight: 500;
             transition: background 0.2s;
+            cursor: pointer;
         }
         .user-item:hover { background: var(--bg-tertiary); }
+        .user-item.selected {
+            background: rgba(108, 99, 255, 0.25);
+            border: 1px solid rgba(108, 99, 255, 0.45);
+        }
         .user-dot {
             width: 8px; height: 8px; border-radius: 50%;
             background: var(--green); flex-shrink: 0;
@@ -208,6 +224,19 @@
             background: var(--bg-secondary);
             border-top: 1px solid var(--border);
             flex-shrink: 0;
+        }
+        #target-select {
+            min-width: 180px;
+            padding: 13px 12px;
+            border-radius: 12px;
+            border: 2px solid var(--border);
+            background: var(--bg-input);
+            color: var(--fg);
+            outline: none;
+        }
+        #target-select:focus {
+            border-color: var(--accent2);
+            box-shadow: 0 0 0 3px var(--accent2-glow);
         }
         #message-input {
             flex: 1; padding: 14px 18px; font-size: 14px;
@@ -239,6 +268,7 @@
         @media (max-width: 700px) {
             .users-panel { display: none; }
             .login-card { width: 90%; padding: 32px 24px; }
+            #target-select { min-width: 130px; }
         }
     </style>
 </head>
@@ -286,6 +316,9 @@
     </div>
 
     <div class="input-bar">
+        <select id="target-select" onchange="onTargetChange()">
+            <option value="">Global (todos)</option>
+        </select>
         <input type="text" id="message-input" placeholder="Escribe un mensaje..."
                autocomplete="off" maxlength="1000">
         <button class="btn-send" onclick="sendMessage()">Enviar ➤</button>
@@ -296,6 +329,8 @@
     const WS_URL = "{{ ws_url }}";
     let socket = null;
     let username = "";
+    let selectedRecipient = "";
+    let currentUsers = [];
 
     // ── Conectar ────────────────────────────────────
     function connectChat() {
@@ -318,13 +353,6 @@
 
         socket.onopen = () => {
             socket.send(JSON.stringify({ type: "join", username: username }));
-
-            // Mostrar pantalla de chat
-            document.getElementById("login-screen").style.display = "none";
-            const chatScreen = document.getElementById("chat-screen");
-            chatScreen.style.display = "flex";
-            document.getElementById("server-info").textContent = "🔗 " + WS_URL + "  —  " + username;
-            document.getElementById("message-input").focus();
         };
 
         socket.onmessage = (event) => {
@@ -345,10 +373,28 @@
 
     // ── Manejar mensajes ────────────────────────────
     function handleMessage(data) {
-        if (data.type === "system") {
+        if (data.type === "join_success") {
+            document.getElementById("login-screen").style.display = "none";
+            const chatScreen = document.getElementById("chat-screen");
+            chatScreen.style.display = "flex";
+            document.getElementById("server-info").textContent = "🔗 " + WS_URL + "  —  " + username;
+            document.getElementById("message-input").focus();
+            addSystemMessage("Conectado como " + data.username, data.timestamp);
+        } else if (data.type === "join_rejected") {
+            const error = document.getElementById("login-error");
+            const btn = document.getElementById("btn-connect");
+            error.textContent = data.content;
+            btn.disabled = false;
+            btn.textContent = "Conectarse";
+            if (socket) {
+                socket.close();
+            }
+        } else if (data.type === "system") {
             addSystemMessage(data.content, data.timestamp);
         } else if (data.type === "message") {
             addChatMessage(data.username, data.content, data.timestamp, data.is_own);
+        } else if (data.type === "private_message") {
+            addPrivateMessage(data.username, data.recipient, data.content, data.timestamp, data.is_own);
         } else if (data.type === "user_list") {
             updateUserList(data.users);
         }
@@ -378,18 +424,80 @@
         container.scrollTop = container.scrollHeight;
     }
 
+    function addPrivateMessage(user, recipient, content, ts, isOwn) {
+        const container = document.getElementById("messages-container");
+        const div = document.createElement("div");
+        div.className = "msg msg-chat" + (isOwn ? " own" : "");
+        const title = isOwn ? (user + " → " + recipient) : (user + " → tú");
+        div.innerHTML = `
+            <div class="msg-header">
+                <span class="msg-username">${escapeHtml(title)}</span>
+                <span class="msg-badge-private">PRIVADO</span>
+                <span class="msg-time">${ts || ""}</span>
+            </div>
+            <div class="msg-content">${escapeHtml(content)}</div>
+        `;
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+    }
+
     function updateUserList(users) {
+        currentUsers = [...users];
         const list = document.getElementById("users-list");
         const count = document.getElementById("user-count");
+        const targetSelect = document.getElementById("target-select");
+
         count.textContent = `(${users.length})`;
         list.innerHTML = "";
-        users.sort().forEach(user => {
+        targetSelect.innerHTML = "<option value=''>Global (todos)</option>";
+
+        [...users].sort().forEach(user => {
+            if (user !== username) {
+                const option = document.createElement("option");
+                option.value = user;
+                option.textContent = "Privado: " + user;
+                targetSelect.appendChild(option);
+            }
+
             const div = document.createElement("div");
-            div.className = "user-item";
+            div.className = "user-item" + (selectedRecipient === user ? " selected" : "");
             const youTag = user === username ? ' <span class="user-you">(tú)</span>' : "";
             div.innerHTML = `<div class="user-dot"></div>${escapeHtml(user)}${youTag}`;
+            if (user !== username) {
+                div.onclick = () => setRecipient(user);
+            }
             list.appendChild(div);
         });
+
+        if (selectedRecipient && !users.includes(selectedRecipient)) {
+            selectedRecipient = "";
+        }
+        targetSelect.value = selectedRecipient;
+        updateInputPlaceholder();
+    }
+
+    function setRecipient(user) {
+        selectedRecipient = user;
+        const targetSelect = document.getElementById("target-select");
+        targetSelect.value = user;
+        updateInputPlaceholder();
+        updateUserList(currentUsers);
+    }
+
+    function onTargetChange() {
+        const targetSelect = document.getElementById("target-select");
+        selectedRecipient = targetSelect.value;
+        updateInputPlaceholder();
+        updateUserList(currentUsers);
+    }
+
+    function updateInputPlaceholder() {
+        const input = document.getElementById("message-input");
+        if (selectedRecipient) {
+            input.placeholder = "Mensaje privado para " + selectedRecipient + "...";
+        } else {
+            input.placeholder = "Escribe un mensaje global...";
+        }
     }
 
     // ── Enviar mensaje ──────────────────────────────
@@ -398,7 +506,15 @@
         const content = input.value.trim();
         if (!content || !socket || socket.readyState !== WebSocket.OPEN) return;
 
-        socket.send(JSON.stringify({ type: "message", content: content }));
+        if (selectedRecipient) {
+            socket.send(JSON.stringify({
+                type: "private_message",
+                recipient: selectedRecipient,
+                content: content,
+            }));
+        } else {
+            socket.send(JSON.stringify({ type: "message", content: content }));
+        }
         input.value = "";
         input.focus();
     }

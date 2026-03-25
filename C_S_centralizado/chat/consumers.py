@@ -10,6 +10,8 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 
 # Registro global de usuarios conectados: {channel_name: username}
 connected_users = {}
+# Indice por nombre para enrutar mensajes privados: {username: channel_name}
+connected_channels_by_username = {}
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
@@ -25,6 +27,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def disconnect(self, close_code):
         """Se ejecuta cuando un cliente WebSocket se desconecta."""
         username = connected_users.pop(self.channel_name, None)
+        if username:
+            connected_channels_by_username.pop(username, None)
 
         await self.channel_layer.group_discard(self.ROOM_GROUP, self.channel_name)
 
@@ -52,7 +56,23 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         if msg_type == "join":
             username = data.get("username", "Anónimo")
+
+            if username in connected_channels_by_username:
+                await self.send(text_data=json.dumps({
+                    "type": "join_rejected",
+                    "content": f"El nombre '{username}' ya esta en uso. Elige otro.",
+                    "timestamp": self._timestamp(),
+                }))
+                return
+
             connected_users[self.channel_name] = username
+            connected_channels_by_username[username] = self.channel_name
+
+            await self.send(text_data=json.dumps({
+                "type": "join_success",
+                "username": username,
+                "timestamp": self._timestamp(),
+            }))
 
             # Mensaje de bienvenida privado
             await self.send(text_data=json.dumps({
@@ -87,6 +107,39 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 },
             )
 
+        elif msg_type == "private_message":
+            sender = connected_users.get(self.channel_name)
+            recipient = data.get("recipient", "")
+            content = data.get("content", "")
+
+            if not sender:
+                return
+
+            if not recipient or not content:
+                return
+
+            recipient_channel = connected_channels_by_username.get(recipient)
+            if not recipient_channel:
+                await self.send(text_data=json.dumps({
+                    "type": "system",
+                    "content": f"No se encontro al usuario '{recipient}' en linea.",
+                    "timestamp": self._timestamp(),
+                }))
+                return
+
+            payload = {
+                "type": "private_chat_message",
+                "from_username": sender,
+                "to_username": recipient,
+                "content": content,
+                "timestamp": self._timestamp(),
+            }
+
+            # Entregar al destinatario y tambien al remitente para reflejar su envio.
+            await self.channel_layer.send(recipient_channel, payload)
+            if recipient_channel != self.channel_name:
+                await self.channel_layer.send(self.channel_name, payload)
+
     # ── Handlers de grupo ──────────────────────────────────
 
     async def chat_message(self, event):
@@ -97,6 +150,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "content": event["content"],
             "timestamp": event["timestamp"],
             "is_own": event["sender_channel"] == self.channel_name,
+        }))
+
+    async def private_chat_message(self, event):
+        """Envía un mensaje privado a emisor/destinatario."""
+        await self.send(text_data=json.dumps({
+            "type": "private_message",
+            "username": event["from_username"],
+            "recipient": event["to_username"],
+            "content": event["content"],
+            "timestamp": event["timestamp"],
+            "is_own": connected_users.get(self.channel_name) == event["from_username"],
         }))
 
     async def system_message(self, event):
@@ -118,7 +182,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def _broadcast_user_list(self):
         """Envía la lista de usuarios a todo el grupo."""
-        users = list(connected_users.values())
+        users = sorted(connected_channels_by_username.keys(), key=str.lower)
         await self.channel_layer.group_send(
             self.ROOM_GROUP,
             {
